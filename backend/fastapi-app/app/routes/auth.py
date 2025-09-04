@@ -1,533 +1,353 @@
 """
-Rutas para autenticación y autorización
+Rutas de autenticación para la API del sistema de incubadora neonatal
 """
-
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from sqlalchemy.orm import Session
-from datetime import datetime, timedelta
+from pydantic import BaseModel, Field
 from typing import Optional
+from datetime import datetime, timedelta
 import jwt
-import bcrypt
-import os
-import uuid
 import logging
 
-from ..database import get_db
-from .. import models, schemas
+from ..shared.python.utils import hash_password, verify_password, generate_secure_token
 
 logger = logging.getLogger(__name__)
-router = APIRouter()
+router = APIRouter(prefix="/auth", tags=["authentication"])
 security = HTTPBearer()
 
-# Configuración JWT
-SECRET_KEY = os.getenv("JWT_SECRET_KEY", "tu-clave-secreta-super-segura-aqui")
+# Configuración JWT (en producción debería estar en variables de entorno)
+SECRET_KEY = "your-secret-key-change-in-production"
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "480"))  # 8 horas
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
 
-# Funciones utilitarias para JWT
+class LoginRequest(BaseModel):
+    """Modelo para request de login"""
+    username: str = Field(..., min_length=3, max_length=50)
+    password: str = Field(..., min_length=6)
+
+
+class LoginResponse(BaseModel):
+    """Modelo para response de login"""
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int
+    user_info: dict
+
+
+class UserCreate(BaseModel):
+    """Modelo para crear usuario"""
+    username: str = Field(..., min_length=3, max_length=50)
+    password: str = Field(..., min_length=6)
+    email: str = Field(..., regex=r'^[\w\.-]+@[\w\.-]+\.\w+$')
+    full_name: str = Field(..., min_length=2, max_length=100)
+    role: str = Field(default="user", regex=r'^(admin|doctor|nurse|user)$')
+
+
+class User(BaseModel):
+    """Modelo de usuario"""
+    id: Optional[str] = None
+    username: str
+    email: str
+    full_name: str
+    role: str
+    is_active: bool = True
+    created_at: Optional[datetime] = None
+
+
+# Base de datos simulada de usuarios (en producción usar base de datos real)
+fake_users_db = {
+    "admin": {
+        "id": "1",
+        "username": "admin",
+        "email": "admin@incubadora.com",
+        "full_name": "Administrador Sistema",
+        "role": "admin",
+        "hashed_password": "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8",  # password: 'admin123'
+        "salt": "admin_salt",
+        "is_active": True,
+        "created_at": datetime.utcnow()
+    },
+    "doctor": {
+        "id": "2",
+        "username": "doctor",
+        "email": "doctor@hospital.com",
+        "full_name": "Dr. Juan Pérez",
+        "role": "doctor",
+        "hashed_password": "ef92b778bafe771e89245b89ecbc08a44a4e166c06659911881f383d4473e94f",  # password: 'doctor123'
+        "salt": "doctor_salt",
+        "is_active": True,
+        "created_at": datetime.utcnow()
+    }
+}
+
+
+def authenticate_user(username: str, password: str) -> Optional[dict]:
+    """
+    Autentica un usuario con username y password
+    """
+    user = fake_users_db.get(username)
+    if not user:
+        return None
+
+    if not verify_password(password, user["hashed_password"], user["salt"]):
+        return None
+
+    return user
+
+
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
-    """Crear token JWT de acceso"""
+    """
+    Crea un token JWT de acceso
+    """
     to_encode = data.copy()
     if expires_delta:
         expire = datetime.utcnow() + expires_delta
     else:
-        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        expire = datetime.utcnow() + timedelta(minutes=15)
 
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
 
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """Verificar y decodificar token JWT"""
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
+    """
+    Obtiene el usuario actual desde el token JWT
+    """
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
     try:
         payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
         username: str = payload.get("sub")
         if username is None:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Token inválido",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-        return schemas.TokenData(username=username)
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token expirado",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    except jwt.JWTError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token inválido",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+            raise credentials_exception
+    except jwt.PyJWTError:
+        raise credentials_exception
 
-
-def get_current_user(token_data: schemas.TokenData = Depends(verify_token), db: Session = Depends(get_db)):
-    """Obtener usuario actual desde el token"""
-    user = db.query(models.User).filter(models.User.username == token_data.username).first()
+    user = fake_users_db.get(username)
     if user is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Usuario no encontrado"
-        )
-    if not user.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Usuario inactivo"
-        )
+        raise credentials_exception
+
     return user
 
 
-def get_current_active_user(current_user: models.User = Depends(get_current_user)):
-    """Obtener usuario actual activo"""
+def get_current_active_user(current_user: dict = Depends(get_current_user)) -> dict:
+    """
+    Obtiene el usuario actual si está activo
+    """
+    if not current_user.get("is_active"):
+        raise HTTPException(status_code=400, detail="Inactive user")
     return current_user
 
 
-# Funciones de hashing de contraseñas
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Verificar contraseña"""
-    return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
-
-
-def get_password_hash(password: str) -> str:
-    """Generar hash de contraseña"""
-    salt = bcrypt.gensalt()
-    return bcrypt.hashpw(password.encode('utf-8'), salt).decode('utf-8')
-
-
-def authenticate_user(db: Session, username: str, password: str):
-    """Autenticar usuario"""
-    user = db.query(models.User).filter(models.User.username == username).first()
-    if not user:
-        return False
-    if not verify_password(password, user.password_hash):
-        return False
-    return user
-
-
-# Endpoints de autenticación
-
-@router.post("/login", response_model=schemas.Token)
-async def login(login_data: schemas.LoginRequest, db: Session = Depends(get_db)):
+def require_role(required_role: str):
     """
-    Iniciar sesión con username y password.
-    Devuelve token JWT para autenticación en requests posteriores.
+    Decorador para requerir un rol específico
+    """
+    def role_checker(current_user: dict = Depends(get_current_active_user)) -> dict:
+        if current_user.get("role") != required_role:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Not enough permissions"
+            )
+        return current_user
+    return role_checker
+
+
+@router.post("/login", response_model=LoginResponse)
+async def login(login_data: LoginRequest):
+    """
+    Endpoint para login de usuarios
     """
     try:
-        # Autenticar usuario
-        user = authenticate_user(db, login_data.username, login_data.password)
+        user = authenticate_user(login_data.username, login_data.password)
         if not user:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Credenciales incorrectas",
+                detail="Incorrect username or password",
                 headers={"WWW-Authenticate": "Bearer"},
             )
 
-        if not user.is_active:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Usuario inactivo"
-            )
-
-        # Crear token de acceso
         access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
         access_token = create_access_token(
-            data={"sub": user.username, "role": user.role},
+            data={"sub": user["username"]},
             expires_delta=access_token_expires
         )
 
-        # Registrar evento de login
-        evento = models.EventoSistema(
-            usuario_id=user.id,
-            tipo_evento='user_login',
-            descripcion=f'Login exitoso para usuario {user.username}'
+        logger.info(f"User {user['username']} logged in successfully")
+
+        return LoginResponse(
+            access_token=access_token,
+            expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+            user_info={
+                "id": user["id"],
+                "username": user["username"],
+                "email": user["email"],
+                "full_name": user["full_name"],
+                "role": user["role"]
+            }
         )
-        db.add(evento)
-        db.commit()
 
-        logger.info(f"Login exitoso para usuario: {user.username}")
-
-        return {
-            "access_token": access_token,
-            "token_type": "bearer",
-            "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60  # en segundos
-        }
-
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error en login: {e}")
+        logger.error(f"Error during login: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Error interno durante autenticación"
-        )
-
-
-@router.post("/register", response_model=schemas.User)
-async def register(user_data: schemas.UserCreate, db: Session = Depends(get_db)):
-    """
-    Registrar nuevo usuario.
-    Solo usuarios admin pueden crear nuevos usuarios.
-    """
-    try:
-        # Verificar si username ya existe
-        existing_user = db.query(models.User).filter(
-            models.User.username == user_data.username
-        ).first()
-
-        if existing_user:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="El username ya está en uso"
-            )
-
-        # Verificar si email ya existe
-        existing_email = db.query(models.User).filter(
-            models.User.email == user_data.email
-        ).first()
-
-        if existing_email:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="El email ya está en uso"
-            )
-
-        # Crear hash de contraseña
-        hashed_password = get_password_hash(user_data.password)
-
-        # Crear usuario
-        db_user = models.User(
-            username=user_data.username,
-            email=user_data.email,
-            password_hash=hashed_password,
-            full_name=user_data.full_name,
-            role=user_data.role,
-            is_active=user_data.is_active
-        )
-
-        db.add(db_user)
-        db.commit()
-        db.refresh(db_user)
-
-        # Registrar evento
-        evento = models.EventoSistema(
-            usuario_id=db_user.id,
-            tipo_evento='user_created',
-            descripcion=f'Usuario creado: {db_user.username}'
-        )
-        db.add(evento)
-        db.commit()
-
-        logger.info(f"Usuario creado: {db_user.username}")
-        return db_user
-
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Error creando usuario: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error creando usuario: {str(e)}"
-        )
-
-
-@router.get("/me", response_model=schemas.User)
-async def get_current_user_info(current_user: models.User = Depends(get_current_active_user)):
-    """
-    Obtener información del usuario actual.
-    """
-    return current_user
-
-
-@router.put("/me", response_model=schemas.User)
-async def update_current_user(
-        user_update: schemas.UserUpdate,
-        current_user: models.User = Depends(get_current_active_user),
-        db: Session = Depends(get_db)
-):
-    """
-    Actualizar información del usuario actual.
-    """
-    try:
-        # Actualizar campos proporcionados
-        update_data = user_update.dict(exclude_unset=True)
-
-        for field, value in update_data.items():
-            if field == 'username' and value != current_user.username:
-                # Verificar que el nuevo username no esté en uso
-                existing = db.query(models.User).filter(
-                    models.User.username == value
-                ).first()
-                if existing:
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail="El username ya está en uso"
-                    )
-
-            if field == 'email' and value != current_user.email:
-                # Verificar que el nuevo email no esté en uso
-                existing = db.query(models.User).filter(
-                    models.User.email == value
-                ).first()
-                if existing:
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail="El email ya está en uso"
-                    )
-
-            setattr(current_user, field, value)
-
-        db.commit()
-        db.refresh(current_user)
-
-        logger.info(f"Usuario actualizado: {current_user.username}")
-        return current_user
-
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Error actualizando usuario: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error actualizando usuario: {str(e)}"
-        )
-
-
-@router.post("/change-password")
-async def change_password(
-        current_password: str,
-        new_password: str,
-        current_user: models.User = Depends(get_current_active_user),
-        db: Session = Depends(get_db)
-):
-    """
-    Cambiar contraseña del usuario actual.
-    """
-    try:
-        # Verificar contraseña actual
-        if not verify_password(current_password, current_user.password_hash):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Contraseña actual incorrecta"
-            )
-
-        # Validar nueva contraseña
-        if len(new_password) < 8:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="La nueva contraseña debe tener al menos 8 caracteres"
-            )
-
-        # Actualizar contraseña
-        current_user.password_hash = get_password_hash(new_password)
-        db.commit()
-
-        # Registrar evento
-        evento = models.EventoSistema(
-            usuario_id=current_user.id,
-            tipo_evento='password_changed',
-            descripcion=f'Contraseña cambiada para usuario {current_user.username}'
-        )
-        db.add(evento)
-        db.commit()
-
-        logger.info(f"Contraseña cambiada para usuario: {current_user.username}")
-
-        return {"message": "Contraseña actualizada exitosamente"}
-
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Error cambiando contraseña: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error cambiando contraseña: {str(e)}"
+            detail="Internal server error during login"
         )
 
 
 @router.post("/logout")
-async def logout(
-        current_user: models.User = Depends(get_current_active_user),
-        db: Session = Depends(get_db)
+async def logout(current_user: dict = Depends(get_current_active_user)):
+    """
+    Endpoint para logout (en implementación real, invalidar token)
+    """
+    logger.info(f"User {current_user['username']} logged out")
+    return {"message": "Successfully logged out"}
+
+
+@router.get("/me", response_model=User)
+async def read_users_me(current_user: dict = Depends(get_current_active_user)):
+    """
+    Obtiene información del usuario actual
+    """
+    return User(
+        id=current_user["id"],
+        username=current_user["username"],
+        email=current_user["email"],
+        full_name=current_user["full_name"],
+        role=current_user["role"],
+        is_active=current_user["is_active"],
+        created_at=current_user.get("created_at")
+    )
+
+
+@router.post("/register", response_model=User)
+async def register_user(
+    user_data: UserCreate,
+    current_user: dict = Depends(require_role("admin"))
 ):
     """
-    Cerrar sesión (invalidar token).
-    En una implementación real, mantendrías una blacklist de tokens.
+    Registra un nuevo usuario (solo admins)
     """
     try:
-        # Registrar evento de logout
-        evento = models.EventoSistema(
-            usuario_id=current_user.id,
-            tipo_evento='user_logout',
-            descripcion=f'Logout para usuario {current_user.username}'
+        # Verificar si el usuario ya existe
+        if user_data.username in fake_users_db:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Username already registered"
+            )
+
+        # Hash de la contraseña
+        hashed_password, salt = hash_password(user_data.password)
+
+        # Crear nuevo usuario
+        user_id = generate_secure_token(8)
+        new_user = {
+            "id": user_id,
+            "username": user_data.username,
+            "email": user_data.email,
+            "full_name": user_data.full_name,
+            "role": user_data.role,
+            "hashed_password": hashed_password,
+            "salt": salt,
+            "is_active": True,
+            "created_at": datetime.utcnow()
+        }
+
+        # Guardar en la "base de datos"
+        fake_users_db[user_data.username] = new_user
+
+        logger.info(f"New user {user_data.username} registered by {current_user['username']}")
+
+        return User(
+            id=new_user["id"],
+            username=new_user["username"],
+            email=new_user["email"],
+            full_name=new_user["full_name"],
+            role=new_user["role"],
+            is_active=new_user["is_active"],
+            created_at=new_user["created_at"]
         )
-        db.add(evento)
-        db.commit()
 
-        logger.info(f"Logout para usuario: {current_user.username}")
-
-        return {"message": "Sesión cerrada exitosamente"}
-
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error en logout: {e}")
+        logger.error(f"Error during user registration: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Error cerrando sesión"
+            detail="Internal server error during registration"
         )
 
 
-# Dependencias de autorización por rol
-def require_role(required_role: str):
-    """
-    Decorator para requerir un rol específico.
-    """
-
-    def role_checker(current_user: models.User = Depends(get_current_active_user)):
-        if current_user.role != required_role:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Acceso denegado. Se requiere rol: {required_role}"
-            )
-        return current_user
-
-    return role_checker
-
-
-def require_any_role(allowed_roles: list):
-    """
-    Decorator para requerir uno de varios roles.
-    """
-
-    def role_checker(current_user: models.User = Depends(get_current_active_user)):
-        if current_user.role not in allowed_roles:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Acceso denegado. Roles permitidos: {', '.join(allowed_roles)}"
-            )
-        return current_user
-
-    return role_checker
-
-
-# Endpoints administrativos (solo admins)
-@router.get("/users", response_model=list[schemas.User])
+@router.get("/users", response_model=list[User])
 async def list_users(
-        current_user: models.User = Depends(require_role("admin")),
-        db: Session = Depends(get_db)
+    current_user: dict = Depends(require_role("admin")),
+    skip: int = 0,
+    limit: int = 100
 ):
     """
-    Listar todos los usuarios (solo administradores).
+    Lista todos los usuarios (solo admins)
     """
-    users = db.query(models.User).all()
+    users = []
+    for user_data in list(fake_users_db.values())[skip:skip + limit]:
+        users.append(User(
+            id=user_data["id"],
+            username=user_data["username"],
+            email=user_data["email"],
+            full_name=user_data["full_name"],
+            role=user_data["role"],
+            is_active=user_data["is_active"],
+            created_at=user_data.get("created_at")
+        ))
+
     return users
 
 
-@router.get("/users/{user_id}", response_model=schemas.User)
-async def get_user(
-        user_id: uuid.UUID,
-        current_user: models.User = Depends(require_role("admin")),
-        db: Session = Depends(get_db)
+@router.patch("/users/{user_id}/status")
+async def update_user_status(
+    user_id: str,
+    is_active: bool,
+    current_user: dict = Depends(require_role("admin"))
 ):
     """
-    Obtener usuario específico por ID (solo administradores).
+    Actualiza el estado activo/inactivo de un usuario (solo admins)
     """
-    user = db.query(models.User).filter(models.User.id == user_id).first()
-    if not user:
+    # Encontrar usuario por ID
+    target_user = None
+    for user_data in fake_users_db.values():
+        if user_data["id"] == user_id:
+            target_user = user_data
+            break
+
+    if not target_user:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Usuario no encontrado"
-        )
-    return user
-
-
-@router.put("/users/{user_id}", response_model=schemas.User)
-async def update_user(
-        user_id: uuid.UUID,
-        user_update: schemas.UserUpdate,
-        current_user: models.User = Depends(require_role("admin")),
-        db: Session = Depends(get_db)
-):
-    """
-    Actualizar usuario específico (solo administradores).
-    """
-    try:
-        user = db.query(models.User).filter(models.User.id == user_id).first()
-        if not user:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Usuario no encontrado"
-            )
-
-        # Actualizar campos proporcionados
-        update_data = user_update.dict(exclude_unset=True)
-
-        for field, value in update_data.items():
-            setattr(user, field, value)
-
-        db.commit()
-        db.refresh(user)
-
-        logger.info(f"Usuario {user_id} actualizado por admin {current_user.username}")
-        return user
-
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Error actualizando usuario {user_id}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error actualizando usuario: {str(e)}"
+            detail="User not found"
         )
 
+    target_user["is_active"] = is_active
 
-@router.delete("/users/{user_id}")
-async def delete_user(
-        user_id: uuid.UUID,
-        current_user: models.User = Depends(require_role("admin")),
-        db: Session = Depends(get_db)
-):
+    logger.info(f"User {target_user['username']} status updated to {'active' if is_active else 'inactive'} by {current_user['username']}")
+
+    return {"message": f"User status updated successfully"}
+
+
+@router.get("/validate-token")
+async def validate_token(current_user: dict = Depends(get_current_active_user)):
     """
-    Desactivar usuario (no eliminar físicamente).
-    """
-    try:
-        user = db.query(models.User).filter(models.User.id == user_id).first()
-        if not user:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Usuario no encontrado"
-            )
-
-        # No permitir desactivar al propio admin
-        if user.id == current_user.id:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="No puedes desactivar tu propia cuenta"
-            )
-
-        # Desactivar usuario en lugar de eliminarlo
-        user.is_active = False
-        db.commit()
-
-        logger.info(f"Usuario {user_id} desactivado por admin {current_user.username}")
-
-        return {"message": "Usuario desactivado exitosamente"}
-
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Error desactivando usuario {user_id}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error desactivando usuario: {str(e)}"
-        )
-
-
-# Endpoint para verificar token (útil para frontend)
-@router.get("/verify-token")
-async def verify_token_endpoint(current_user: models.User = Depends(get_current_active_user)):
-    """
-    Verificar si el token actual es válido.
+    Valida si un token es válido y retorna información básica del usuario
     """
     return {
         "valid": True,
-        "user": current_user.username,
-        "role": current_user.role,
-        "expires": "Token válido"
+        "user": {
+            "username": current_user["username"],
+            "role": current_user["role"]
+        }
     }
